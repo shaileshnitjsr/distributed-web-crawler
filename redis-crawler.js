@@ -35,7 +35,6 @@ const agent = new Agent({
     pipelining: 1
 });
 
-const BLOOM_FILTER = "visited_urls";
 const URL_QUEUE = "url_queue";
 
 const RATE_LIMIT = 2;
@@ -62,14 +61,12 @@ async function normalizeUrl(link, currentUrl) {
         }
 
         return url.href;
-
     } catch {
         return null;
     }
 }
 
 async function addUrl(url) {
-
     const added = await redis.set(
         `seen:${url}`,
         "1",
@@ -83,15 +80,18 @@ async function addUrl(url) {
             URL_QUEUE,
             url
         );
+
+        console.log(
+            "Added to queue:",
+            url
+        );
     }
 }
 
 async function waitForRateLimit(domain) {
-
     const key = `rate:${domain}`;
 
     while (true) {
-
         const count =
             await redis.incr(key);
 
@@ -114,7 +114,6 @@ async function waitForRateLimit(domain) {
 }
 
 async function canCrawl(url) {
-
     const parsedUrl =
         new URL(url);
 
@@ -122,12 +121,10 @@ async function canCrawl(url) {
         parsedUrl.origin;
 
     if (!robotsCache.has(domain)) {
-
         const robotsUrl =
             `${domain}/robots.txt`;
 
         try {
-
             const { body } =
                 await request(
                     robotsUrl,
@@ -149,9 +146,7 @@ async function canCrawl(url) {
                 domain,
                 robots
             );
-
         } catch {
-
             robotsCache.set(
                 domain,
                 null
@@ -177,7 +172,6 @@ async function savePage(
     title,
     statusCode
 ) {
-
     await pool.query(
         `
         INSERT INTO pages
@@ -199,7 +193,6 @@ async function savePage(
 }
 
 async function crawl(url) {
-
     const domain =
         new URL(url).hostname;
 
@@ -207,7 +200,6 @@ async function crawl(url) {
         await canCrawl(url);
 
     if (!allowed) {
-
         console.log(
             "Blocked by robots.txt:",
             url
@@ -250,11 +242,11 @@ async function crawl(url) {
         response.statusCode
     );
 
-    for (
-        const element
-        of $("a").toArray()
-    ) {
+    let discovered = 0;
 
+    for (
+        const element of $("a").toArray()
+    ) {
         const link =
             $(element).attr("href");
 
@@ -269,18 +261,21 @@ async function crawl(url) {
             );
 
         if (normalizedUrl) {
+            discovered++;
 
             await addUrl(
                 normalizedUrl
             );
         }
     }
+
+    console.log(
+        `Discovered ${discovered} links from ${url}`
+    );
 }
 
 async function worker() {
-
     while (true) {
-
         const result =
             await redis.brPop(
                 URL_QUEUE,
@@ -295,14 +290,16 @@ async function worker() {
             result.element;
 
         try {
-
             await crawl(url);
-
         } catch (error) {
-
             console.log(
                 "Failed:",
                 url
+            );
+
+            console.log(
+                "Error:",
+                error.message
             );
 
             const retryKey =
@@ -317,7 +314,6 @@ async function worker() {
                 retries <=
                 MAX_RETRIES
             ) {
-
                 console.log(
                     `Retrying ${url} ` +
                     `(${retries}/${MAX_RETRIES})`
@@ -327,9 +323,7 @@ async function worker() {
                     URL_QUEUE,
                     url
                 );
-
             } else {
-
                 console.log(
                     `Giving up: ${url}`
                 );
@@ -343,37 +337,55 @@ async function worker() {
 }
 
 async function main() {
+    try {
+        await redis.connect();
 
-    await redis.connect();
-
-    console.log(
-        "Connected to Redis"
-    );
-
-    const workers = [];
-
-    for (
-        let i = 0;
-        i < 30;
-        i++
-    ) {
-
-        workers.push(
-            worker()
+        console.log(
+            "Connected to Redis"
         );
+
+        console.log(
+            "Start URL:",
+            startUrl
+        );
+
+        console.log(
+            "Allowed domain:",
+            allowedDomain
+        );
+
+        // Automatically add the starting URL
+        // to Redis. No manual LPUSH needed.
+        await addUrl(startUrl);
+
+        const workers = [];
+
+        for (
+            let i = 0;
+            i < 30;
+            i++
+        ) {
+            workers.push(
+                worker()
+            );
+        }
+
+        await Promise.all(
+            workers
+        );
+
+        console.log(
+            "Finished"
+        );
+    } catch (error) {
+        console.error(
+            "Crawler error:",
+            error
+        );
+    } finally {
+        await redis.quit();
+        await pool.end();
     }
-
-    await Promise.all(
-        workers
-    );
-
-    await redis.quit();
-
-    await pool.end();
-
-    console.log(
-        "Finished"
-    );
 }
 
 main();
