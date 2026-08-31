@@ -67,15 +67,19 @@ async function normalizeUrl(link, currentUrl) {
 }
 
 async function addUrl(url) {
-    const added = await redis.set(
-        `seen:${url}`,
-        "1",
-        {
-            NX: true
-        }
-    );
+    const exists = await redis.sendCommand([
+        "BF.EXISTS",
+        "visited_urls",
+        url
+    ]);
 
-    if (added === "OK") {
+    if (Number(exists) === 0) {
+        await redis.sendCommand([
+            "BF.ADD",
+            "visited_urls",
+            url
+        ]);
+
         await redis.lPush(
             URL_QUEUE,
             url
@@ -87,7 +91,6 @@ async function addUrl(url) {
         );
     }
 }
-
 async function waitForRateLimit(domain) {
     const key = `rate:${domain}`;
 
