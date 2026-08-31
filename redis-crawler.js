@@ -92,30 +92,35 @@ async function addUrl(url) {
     }
 }
 async function waitForRateLimit(domain) {
-    const key = `rate:${domain}`;
+    const key = `rate_schedule:${domain}`;
 
     while (true) {
-        const count =
-            await redis.incr(key);
+        const now = Date.now();
 
-        if (count === 1) {
-            await redis.pExpire(
-                key,
-                RATE_WINDOW
-            );
-        }
+        await redis.zRemRangeByScore(key, 0, now - RATE_WINDOW);
 
-        if (count <= RATE_LIMIT) {
+        const count = await redis.zCard(key);
+
+        if (count < RATE_LIMIT) {
+            await redis.zAdd(key, {
+                score: now,
+                value: `${now}-${Math.random()}`
+            });
             return;
         }
 
-        await new Promise(
-            resolve =>
-                setTimeout(resolve, 100)
-        );
+        const oldest = await redis.zRangeWithScores(key, 0, 0);
+
+        if (oldest.length > 0) {
+            const waitTime = Math.max(
+                50,
+                RATE_WINDOW - (now - oldest[0].score)
+            );
+
+            await new Promise(resolve => setTimeout(resolve, waitTime));
+        }
     }
 }
-
 async function canCrawl(url) {
     const parsedUrl =
         new URL(url);
@@ -276,7 +281,20 @@ async function crawl(url) {
         `Discovered ${discovered} links from ${url}`
     );
 }
-
+async function releaseLock(key, value) {
+    await redis.eval(
+        `
+        if redis.call("GET", KEYS[1]) == ARGV[1] then
+            return redis.call("DEL", KEYS[1])
+        end
+        return 0
+        `,
+        {
+            keys: [key],
+            arguments: [value]
+        }
+    );
+}
 async function worker() {
     while (true) {
         const result =
@@ -291,6 +309,28 @@ async function worker() {
 
         const url =
             result.element;
+
+        const lockKey = `lock:${url}`;
+        const lockValue =
+            `${process.pid}-${Date.now()}`;
+
+        const locked =
+            await redis.set(
+                lockKey,
+                lockValue,
+                {
+                    NX: true,
+                    PX: 30000
+                }
+            );
+
+        if (locked !== "OK") {
+            console.log(
+                "Skipped locked URL:",
+                url
+            );
+            continue;
+        }
 
         try {
             await crawl(url);
@@ -335,10 +375,14 @@ async function worker() {
                     retryKey
                 );
             }
+        } finally {
+            await releaseLock(
+                lockKey,
+                lockValue
+            );
         }
     }
 }
-
 async function main() {
     try {
         await redis.connect();
