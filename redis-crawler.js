@@ -30,6 +30,16 @@ const pool = new Pool({
     port: Number(process.env.DB_PORT) || 5432
 });
 
+const Minio = require("minio");
+
+const minioClient = new Minio.Client({
+    endPoint: process.env.MINIO_HOST || "minio",
+    port: 9000,
+    useSSL: false,
+    accessKey: process.env.MINIO_ACCESS_KEY || "minioadmin",
+    secretKey: process.env.MINIO_SECRET_KEY || "minioadmin"
+});
+
 const agent = new Agent({
     connections: 30,
     pipelining: 1
@@ -243,6 +253,19 @@ async function crawl(url) {
         $("title").text() ||
         $("h1").first().text() ||
         null;
+
+    const objectName =
+        Buffer.from(url).toString("base64url") + ".html";
+
+    await minioClient.putObject(
+        "pages",
+        objectName,
+        html,
+        Buffer.byteLength(html),
+        {
+            "Content-Type": "text/html"
+        }
+    );
 
     await savePage(
         url,

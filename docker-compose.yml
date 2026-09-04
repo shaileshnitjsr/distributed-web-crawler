@@ -13,6 +13,15 @@ services:
       - postgres_data:/var/lib/postgresql/data
       - ./init-db.sql:/docker-entrypoint-initdb.d/init.sql
 
+  minio:
+    image: minio/minio
+    command: server /data --console-address ":9001"
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    volumes:
+      - minio_data:/data
+
   crawler:
     build: .
     image: distributed-crawler:latest
@@ -26,9 +35,10 @@ services:
       DB_PASSWORD: crawler
       DB_NAME: crawler_db
       DB_PORT: 5432
-      START_URL: http://host.docker.internal:3000/page/1
+      START_URL: http://host.docker.internal:3000/page/1/
     deploy:
       replicas: 3
 
 volumes:
   postgres_data:
+  minio_data:

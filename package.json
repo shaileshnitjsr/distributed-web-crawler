@@ -11,6 +11,7 @@
   "description": "",
   "dependencies": {
     "cheerio": "^1.2.0",
+    "minio": "^8.0.7",
     "pg": "^8.23.0",
     "redis": "^6.2.1",
     "robots-parser": "^3.0.1",
