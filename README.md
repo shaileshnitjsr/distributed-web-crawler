@@ -1,28 +1,24 @@
-# 🚀 Distributed Web Crawler
+# Distributed Web Crawler
 
-A fault-tolerant, Dockerized distributed web crawler built with **Node.js, Redis, PostgreSQL, Docker, Undici, and Cheerio**.
+A distributed, concurrent web crawler built with Node.js, Redis, PostgreSQL, MinIO, and Docker Compose.
 
-The system distributes URL crawling across multiple worker processes using **Redis as a shared work queue**, while PostgreSQL provides persistent storage for crawled page metadata.
+The crawler uses a shared Redis frontier so that multiple crawler containers can process URLs concurrently while coordinating deduplication, distributed locking, rate limiting, and retries.
 
-The crawler supports URL deduplication, robots.txt compliance, distributed rate limiting, retries, URL normalization, and concurrent worker execution.
-
----
-
-## 📌 Overview
-
-Traditional web crawlers often run as a single process, which limits throughput and makes scaling difficult.
-
-This project implements a distributed architecture where multiple crawler workers consume URLs from a shared Redis queue.
+## Architecture
 
 ```text
                          ┌─────────────────────┐
-                         │      Seed URL       │
+                         │      Start URL      │
                          └──────────┬──────────┘
                                     │
                                     ▼
                          ┌─────────────────────┐
-                         │        Redis        │
-                         │    URL Work Queue   │
+                         │       Redis         │
+                         │                     │
+                         │   URL Work Queue    │
+                         │   Bloom Filter      │
+                         │   Rate Scheduler    │
+                         │   Distributed Lock  │
                          └──────────┬──────────┘
                                     │
                    ┌────────────────┼────────────────┐
@@ -30,34 +26,41 @@ This project implements a distributed architecture where multiple crawler worker
                    ▼                ▼                ▼
              ┌───────────┐    ┌───────────┐    ┌───────────┐
              │ Crawler 1 │    │ Crawler 2 │    │ Crawler 3 │
+             │  Workers  │    │  Workers  │    │  Workers  │
              └─────┬─────┘    └─────┬─────┘    └─────┬─────┘
                    │                │                │
                    └────────────────┼────────────────┘
                                     │
-                                    ▼
-                         ┌─────────────────────┐
-                         │     PostgreSQL      │
-                         │  Crawled Page Data  │
-                         └─────────────────────┘
+                    ┌───────────────┴───────────────┐
+                    │                               │
+                    ▼                               ▼
+          ┌─────────────────┐             ┌─────────────────┐
+          │   PostgreSQL    │             │      MinIO      │
+          │ Page Metadata   │             │  HTML Storage   │
+          └─────────────────┘             └─────────────────┘
 
-Each crawler worker independently retrieves URLs from the shared queue and processes them concurrently.
+Multiple crawler containers share the same Redis queue. This allows URLs to be distributed across workers instead of maintaining separate queues for each crawler.
 
-✨ Features
+Features
 Distributed Crawling
 
 Multiple crawler containers consume URLs from a shared Redis queue.
 
 Redis Work Queue
 
-Redis provides the central URL queue used by all crawler workers.
+Redis maintains the central url_queue used by all crawler workers.
 
-URL Deduplication
+Bloom Filter Deduplication
 
-Redis SET NX operations prevent the same URL from being processed multiple times.
+Redis Bloom Filter is used to avoid repeatedly adding the same URL to the crawling queue.
+
+Distributed URL Locking
+
+Redis SET NX PX locks ensure that only one worker processes a URL at a time when multiple workers encounter the same URL.
 
 URL Normalization
 
-Relative URLs are converted to absolute URLs and fragments are removed before processing.
+Relative URLs are converted to absolute URLs and URL fragments are removed before processing.
 
 Domain Restriction
 
@@ -69,60 +72,83 @@ The crawler checks robots.txt before requesting pages and skips URLs disallowed 
 
 Distributed Rate Limiting
 
-Redis coordinates request rate limiting across workers to prevent excessive requests to the target server.
+Redis sorted sets are used to coordinate request scheduling across workers and control request frequency.
 
 Retry Mechanism
 
-Failed URLs are retried automatically up to a configurable maximum number of attempts.
+Network and request failures are retried automatically up to a configurable maximum number of attempts.
 
 PostgreSQL Storage
 
 Crawled page metadata is stored persistently in PostgreSQL.
 
+MinIO Object Storage
+
+The complete HTML response of successfully crawled pages is stored in MinIO.
+
 Concurrent Workers
 
-Each crawler container runs multiple asynchronous workers, allowing concurrent URL processing.
+Each crawler container runs multiple asynchronous workers for concurrent URL processing.
 
 Dockerized Infrastructure
 
-Redis, PostgreSQL, and crawler workers run as Docker containers and can be scaled using Docker Compose.
+Redis, PostgreSQL, MinIO, and crawler workers run as Docker containers.
 
-🛠️ Tech Stack
+Tech Stack
 Technology	Purpose
 Node.js	Crawler runtime
-Undici	High-performance HTTP client
+Undici	HTTP client
 Cheerio	HTML parsing and link extraction
-Redis	Distributed URL queue, deduplication and rate limiting
-PostgreSQL	Persistent crawl data storage
+Redis	Queue, Bloom Filter, locking and rate limiting
+PostgreSQL	Persistent page metadata
+MinIO	HTML object storage
 Docker	Containerization
-Docker Compose	Multi-container orchestration
-🧠 System Design
-1. URL Queue
+Docker Compose	Service orchestration
+System Design
+1. URL Frontier
 
-Redis maintains the shared crawling queue:
+Redis maintains the shared URL queue:
 
 Redis
+
 └── url_queue
     ├── URL A
     ├── URL B
     ├── URL C
     └── URL D
 
-All crawler workers consume URLs from this same queue.
+All crawler containers consume URLs from this queue.
 
-This allows workers to distribute the workload automatically.
+Because the queue is shared, work can be distributed between multiple crawler containers.
 
 2. URL Deduplication
 
-Before adding a URL to the queue, the crawler creates a Redis key:
+Before adding a URL to the queue, the crawler checks the Redis Bloom Filter:
 
-seen:<url>
+visited_urls
 
-The URL is inserted only if the key does not already exist.
+If the URL has already been seen, it is not added again.
 
-This prevents duplicate crawling when multiple pages contain links to the same URL.
+This reduces duplicate URLs entering the crawling frontier.
 
-3. Crawling Pipeline
+3. Distributed Locking
+
+Workers acquire a Redis lock before processing a URL:
+
+lock:<url>
+
+The lock uses Redis SET NX with an expiration time.
+
+Conceptually:
+
+Worker 1 ──► acquire lock ──► process URL
+Worker 2 ──► lock exists ───► skip URL
+
+The lock has a TTL so that a crashed worker does not hold the URL forever.
+
+The lock is released safely using a token check.
+
+4. Crawling Pipeline
 
 For every URL:
 
@@ -136,6 +162,9 @@ Check Domain
  │
  ▼
 Check robots.txt
+ │
+ ▼
+Acquire Distributed Lock
  │
  ▼
 Apply Rate Limit
@@ -154,26 +183,36 @@ Parse HTML
                  Normalize URLs
                        │
                        ▼
-                 Redis Queue
+                 Bloom Filter
                        │
                        ▼
-                  Next Worker
-4. PostgreSQL Storage
+                  Redis Queue
+5. PostgreSQL Storage
 
-Each successfully crawled page is stored with:
+For each successfully crawled page, the crawler stores:
 
 url
 title
 status_code
 crawled_at
 
-Duplicate database entries are prevented using the URL constraint.
+The URL column has a uniqueness constraint to prevent duplicate database records.
 
-⚡ Concurrency Model
+6. MinIO Storage
+
+The complete HTML response is stored in MinIO.
+
+Each URL is converted into a deterministic object name:
+
+<base64url-encoded-url>.html
+
+This provides persistent storage of the actual crawled page content while PostgreSQL stores structured metadata.
+
+Concurrency Model
 
 Each crawler container launches multiple asynchronous workers.
 
-For example:
+Example:
 
 Crawler Container
 │
@@ -183,241 +222,210 @@ Crawler Container
 ├── ...
 └── Worker 30
 
-Multiple crawler containers can then be launched:
+Multiple crawler containers can share the same Redis infrastructure:
 
-Crawler 1 → Workers
-Crawler 2 → Workers
-Crawler 3 → Workers
-        │
-        ▼
-      Redis
+Crawler 1 ──┐
+Crawler 2 ──┼──► Redis Queue
+Crawler 3 ──┘
 
-This provides two levels of concurrency:
+This creates two levels of concurrency:
 
-Multiple workers within each crawler container
-Multiple crawler containers sharing the Redis queue
-🔒 Rate Limiting
+Multiple asynchronous workers inside each crawler container.
+Multiple crawler containers sharing the same Redis queue.
+Rate Limiting
 
-Redis is used to coordinate request rate limiting between workers.
+Redis sorted sets are used as a distributed scheduling mechanism.
 
-The crawler maintains a Redis counter for each domain and limits the number of requests within a configured time window.
+The crawler maintains scheduling information for each domain:
 
-This prevents multiple workers from overwhelming the target server.
+rate_schedule:<domain>
 
-🤖 robots.txt
+Workers coordinate through Redis before making requests.
 
-Before crawling a URL, the crawler checks the corresponding:
+This prevents multiple crawler instances from independently sending requests too quickly to the same domain.
+
+robots.txt
+
+Before crawling a URL, the crawler checks the website's:
 
 /robots.txt
 
-If crawling is disallowed, the URL is skipped.
+URLs disallowed by the site's robots policy are skipped.
 
-This helps the crawler follow website crawling policies.
+The crawler also caches robots.txt information to avoid repeatedly downloading the same file.
 
-🔄 Retry Handling
+Retry Handling
 
-Network failures and request errors are handled using a retry mechanism.
+Network and request failures are handled using Redis-backed retry tracking.
 
-The crawler tracks retries using Redis:
+Retry information is stored using:
 
 retry:<url>
 
-A failed URL is retried until:
+A failed request is retried until:
 
 MAX_RETRIES
 
 is reached.
 
-After that, the crawler gives up on the URL.
+After the maximum number of attempts, the crawler gives up on that URL.
 
-🐳 Docker Architecture
+Docker Architecture
 
-The application consists of three main services:
+The system contains these services:
 
-┌─────────────────────────────────────┐
-│           Docker Compose            │
-│                                     │
-│  ┌────────────┐                     │
-│  │   Redis    │                     │
-│  └─────┬──────┘                     │
-│        │                             │
-│  ┌─────┴───────────────────────┐    │
-│  │                             │    │
-│  ▼                             ▼    │
-│ Crawler 1    Crawler 2    Crawler 3 │
-│  │                             │    │
-│  └──────────────┬──────────────┘    │
-│                 ▼                   │
-│          ┌──────────────┐           │
-│          │  PostgreSQL  │           │
-│          └──────────────┘           │
-└─────────────────────────────────────┘
+┌──────────────────────────────────────┐
+│           Docker Compose             │
+│                                      │
+│  ┌──────────┐                        │
+│  │  Redis   │◄──────────────┐        │
+│  └──────────┘               │        │
+│       ▲                     │        │
+│       │                     │        │
+│  ┌────┴────┐  ┌──────────┐  │        │
+│  │Crawler 1│  │Crawler 2 │  │        │
+│  └─────────┘  └──────────┘  │        │
+│                             │        │
+│                        ┌────┴────┐   │
+│                        │Crawler 3│   │
+│                        └─────────┘   │
+│                                      │
+│  ┌────────────┐    ┌─────────────┐  │
+│  │ PostgreSQL │    │    MinIO    │  │
+│  └────────────┘    └─────────────┘  │
+└──────────────────────────────────────┘
 
-Crawler workers can be scaled using:
-
-docker compose up --scale crawler=3
-🚀 Getting Started
-Prerequisites
-
-Install:
-
-Node.js 20+
-Docker
-Docker Compose
-1. Clone the Repository
-git clone <YOUR_REPOSITORY_URL>
-cd distributed-web-crawler
-2. Install Dependencies
-npm install
-3. Start the Test Website
-
-The project includes a local test website containing 50 interconnected pages.
-
-Run:
-
-node test-server.js
-
-The server will be available at:
-
-http://localhost:3000
-
-Keep this terminal running.
-
-4. Start Redis and PostgreSQL
-
-In another terminal:
-
-docker compose up -d redis postgres
-
-Verify the services:
-
-docker compose ps
-5. Build the Crawler
-docker compose build crawler
-6. Run a Single Crawler
-docker compose up --scale crawler=1
-
-The crawler automatically adds the configured START_URL to the Redis queue.
-
-7. Run Multiple Crawlers
-
-To run three crawler containers:
-
-docker compose up --scale crawler=3
-
-The containers share the same Redis queue and distribute URLs between themselves.
-
-🔍 Verification
-
-The crawler was tested against a local website containing 50 interconnected pages.
-
-The distributed system successfully:
-
-Crawled all 50 pages
-Stored 50 pages in PostgreSQL
-Stored 50 unique URLs
-Used Redis as a shared work queue
-Distributed URLs between multiple crawler containers
-Prevented duplicate URL processing
-Successfully communicated between Docker containers
-
-Database verification:
-
-SELECT COUNT(*), COUNT(DISTINCT url)
-FROM pages;
-
-Result:
-
- count | count
--------+-------
-    50 |    50
-
-This confirms:
-
-50 total pages
-50 unique URLs
-0 duplicate URLs
-📊 Distributed Execution
-
-During the three-worker test, different crawler containers processed different URLs.
+Crawler containers can be scaled using Docker Compose.
 
 Example:
 
-crawler-2 → page/45
-crawler-3 → page/46
-crawler-2 → page/47
-crawler-3 → page/48
-crawler-2 → page/49
-crawler-3 → page/50
+docker compose up --build --scale crawler=3
+Running the Project
+1. Start a test website
 
-All workers consumed URLs from the same Redis queue and stored results in the same PostgreSQL database.
+The repository contains a local test website.
 
-This demonstrates the distributed nature of the system.
+From the test-site directory:
 
-📁 Project Structure
+python3 -m http.server 3000
+
+The test website will be available at:
+
+http://localhost:3000
+2. Start the crawler infrastructure
+
+From the project root:
+
+docker compose up --build --scale crawler=3
+
+The crawler will automatically add the configured START_URL to the Redis queue.
+
+3. View crawler logs
+docker compose logs -f crawler
+4. Stop the system
+docker compose down
+
+Docker volumes are preserved unless explicitly removed.
+
+Configuration
+
+Important crawler configuration values include:
+
+START_URL
+REDIS_HOST
+DB_HOST
+DB_PORT
+DB_NAME
+DB_USER
+DB_PASSWORD
+MINIO_HOST
+MINIO_ACCESS_KEY
+MINIO_SECRET_KEY
+
+The starting URL and infrastructure configuration are provided through Docker Compose environment variables.
+
+Verification
+
+The project can be verified by checking the different infrastructure components.
+
+Redis
+
+Check the crawling queue:
+
+docker compose exec redis redis-cli LLEN url_queue
+
+Check the Bloom Filter:
+
+docker compose exec redis redis-cli BF.EXISTS visited_urls "<URL>"
+PostgreSQL
+
+Check crawled pages:
+
+docker compose exec postgres \
+psql -U crawler -d crawler_db \
+-c "SELECT COUNT(*) FROM pages;"
+MinIO
+
+List stored HTML objects:
+
+docker compose exec minio mc alias set \
+local http://localhost:9000 minioadmin minioadmin
+
+Then:
+
+docker compose exec minio mc ls --recursive local/pages
+Fault Tolerance
+
+The crawler contains several mechanisms for handling failures:
+
+Network Failure
+      │
+      ▼
+   Retry
+      │
+      ├── Success ──► Store Result
+      │
+      └── Max Retries ──► Give Up
+
+Distributed locks also use expiration times so that crashed workers do not permanently block URLs.
+
+Project Structure
 distributed-web-crawler/
 │
-├── crawler.js
 ├── redis-crawler.js
-│
-├── test-server.js
-│
-├── redis-test.js
-├── init-redis.js
-├── db-test.js
-├── init-db.sql
-│
-├── Dockerfile
-├── docker-compose.yml
-│
 ├── package.json
 ├── package-lock.json
-├── .gitignore
+├── Dockerfile
+├── docker-compose.yml
+├── init-db.sql
+├── test-site/
+│   └── page/
+│       ├── 1/
+│       ├── 2/
+│       └── ...
+│
 └── README.md
-📌 Key Files
-redis-crawler.js
+Learning Objectives
 
-Main distributed crawler implementation.
+This project demonstrates practical concepts in:
 
-Handles:
-
-Redis queue
-URL deduplication
-HTTP requests
+Distributed systems
+Concurrent programming
+Message/work queues
+Redis
+Bloom Filters
+Distributed locking
+Rate limiting
+Fault tolerance
+Web crawling
+HTTP networking
 HTML parsing
-robots.txt
-rate limiting
-retries
-PostgreSQL storage
-worker management
-test-server.js
-
-Local test website used to validate crawler functionality.
-
-docker-compose.yml
-
-Defines the crawler, Redis, and PostgreSQL services.
-
-Dockerfile
-
-Builds the crawler container image.
-
-init-db.sql
-
-Initializes the PostgreSQL database schema.
-
-🧪 Testing
-
-The project was tested using:
-
-Single Worker
-docker compose up --scale crawler=1
-Multiple Workers
-docker compose up --scale crawler=3
-
-Both configurations successfully crawled the complete 50-page test website.
-
-🔮 Future Improvements
+PostgreSQL
+Object storage
+Docker
+Docker Compose
+Service orchestration
+Future Improvements
 
 Possible improvements include:
 
@@ -434,20 +442,3 @@ Distributed tracing
 Dynamic worker scaling
 Production deployment
 Large-scale external website testing
-🎯 Learning Objectives
-
-This project demonstrates practical concepts in:
-
-Distributed systems
-Message/work queues
-Concurrent programming
-Docker containerization
-Redis
-PostgreSQL
-Web crawling
-HTTP networking
-HTML parsing
-Rate limiting
-Fault tolerance
-URL deduplication
-Service orchestration
