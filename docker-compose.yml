@@ -2,6 +2,11 @@ services:
 
   redis:
     image: redis:8
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
 
   postgres:
     image: postgres:17
@@ -12,6 +17,11 @@ services:
     volumes:
       - postgres_data:/var/lib/postgresql/data
       - ./init-db.sql:/docker-entrypoint-initdb.d/init.sql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U crawler -d crawler_db"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
 
   minio:
     image: minio/minio
@@ -21,13 +31,22 @@ services:
       - "9001:9001"
     volumes:
       - minio_data:/data
+    healthcheck:
+      test: ["CMD", "mc", "ready", "local"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
 
   crawler:
     build: .
     image: distributed-crawler:latest
     depends_on:
-      - redis
-      - postgres
+      redis:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
     environment:
       REDIS_HOST: redis
       DB_HOST: postgres
@@ -35,6 +54,9 @@ services:
       DB_PASSWORD: crawler
       DB_NAME: crawler_db
       DB_PORT: 5432
+      MINIO_HOST: minio
+      MINIO_ACCESS_KEY: minioadmin
+      MINIO_SECRET_KEY: minioadmin
       START_URL: http://host.docker.internal:3000/page/1/
     deploy:
       replicas: 3
